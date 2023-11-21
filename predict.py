@@ -1,29 +1,16 @@
 # Prediction interface for Cog
-from cog import BasePredictor, Input, Path
 import os
 import math
 import torch
+from cog import BasePredictor, Input, Path
+from diffusers import AutoPipelineForInpainting
 from PIL import Image
-from diffusers import (AutoPipelineForInpainting,
-    DDIMScheduler,
-    DPMSolverMultistepScheduler,
-    EulerAncestralDiscreteScheduler, 
-    EulerDiscreteScheduler,
-    HeunDiscreteScheduler, 
-    PNDMScheduler
-)
+from typing import List
 
-MODEL_NAME = "diffusers/stable-diffusion-xl-1.0-inpainting-0.1"
+# Stable Diffusion v2 with inpainting. Mask generation presented in LAMA in
+# combination with latent VAE representation of the masked image.
+MODEL_NAME = "stabilityai/stable-diffusion-2-inpainting"
 MODEL_CACHE = "model-cache"
-
-SCHEDULERS = {
-    "DDIM": DDIMScheduler,
-    "DPMSolverMultistep": DPMSolverMultistepScheduler,
-    "HeunDiscrete": HeunDiscreteScheduler,
-    "K_EULER_ANCESTRAL": EulerAncestralDiscreteScheduler,
-    "K_EULER": EulerDiscreteScheduler,
-    "PNDM": PNDMScheduler,
-}
 
 class Predictor(BasePredictor):
     def setup(self) -> None:
@@ -34,86 +21,82 @@ class Predictor(BasePredictor):
             variant="fp16"
         ).to("cuda")
 
-    def scale_down_image(self, image_path, max_size):
-        image = Image.open(image_path)
-        width, height = image.size
-        scaling_factor = min(max_size/width, max_size/height)
-        new_width = int(width * scaling_factor)
-        new_height = int(height * scaling_factor)
-        resized_image = image.resize((new_width, new_height))
-        cropped_image = self.crop_center(resized_image)
-        return cropped_image
-
-    def crop_center(self, pil_img):
-        img_width, img_height = pil_img.size
-        crop_width = self.base(img_width)
-        crop_height = self.base(img_height)
-        return pil_img.crop(
-            (
-                (img_width - crop_width) // 2,
-                (img_height - crop_height) // 2,
-                (img_width + crop_width) // 2,
-                (img_height + crop_height) // 2)
-            )
-
-    def base(self, x):
-        return int(8 * math.floor(int(x)/8))
-    
     def predict(
         self,
-        image: Path = Input(description="Input image"),
-        mask: Path = Input(description="Mask image"),
+        image: Path = Input(
+            description="Input image to inpaint.",
+            default=None,
+        ),
+        mask: Path = Input(
+            description="Black and white image to use as mask for inpainting over the image provided. White-colored regions are inpainted and black-colored regions are preserved",
+            default=None,
+        ),
         prompt: str = Input(
             description="Input prompt",
-            default="An astronaut riding a rainbow unicorn",
+            default="nike shoes in billboard",
         ),
         negative_prompt: str = Input(
-            description="Input Negative Prompt",
-            default="monochrome, lowres, bad anatomy, worst quality, low quality",
+            description="Specify things to not see in the output",
+            default="poorly drawn hands, poorly drawn feet, poorly drawn face, poorly drawn eyes, extra limbs, disfigured, deformed, bad anatomy, distorted text, incorrect text spelling",
         ),
-        scheduler: str = Input(
-            description="scheduler",
-            choices=SCHEDULERS.keys(),
-            default="K_EULER",
+        num_outputs: int = Input(
+            description="Number of images to output. > 2 might generate out-of-memory errors.",
+            ge=1,
+            le=4,
+            default=1,
+        ),
+        seed: int = Input(
+            description="Random seed. Set to 0 to randomize the seed. If you need tweaks to a generated image, reuse the same seed number from output logs.",
+            default=0,
+        ),
+        num_inference_steps: int = Input(
+            description="Number of denoising steps. More denoising steps usually lead to a higher quality image at the expense of slower inference",
+            ge=1,
+            le=500,
+            default=100,
         ),
         guidance_scale: float = Input(
-            description="Guidance scale", ge=0, le=10, default=8.0
+            description="A higher guidance scale value generate images closely to the text prompt at the expense of lower image quality. Guidance scale is enabled when guidance_scale > 1.",
+            ge=1,
+            le=20,
+            default=7.5,
         ),
-        steps: int = Input(
-            description="Number of denoising steps", ge=1, le=80, default=20),
-        strength: float = Input(
-            description="1.0 corresponds to full destruction of information in image", ge=0.01, le=1.0, default=0.7),
-        seed: int = Input(
-            description="Random seed. Leave blank to randomize the seed", default=None
-        ),
-    ) -> Path:
+    ) -> List[Path]:
+
         """Run a single prediction on the model"""
-        if seed is None:
+        if (seed is None) or (seed <=0):
             seed = int.from_bytes(os.urandom(2), "big")
-        print(f"Using seed: {seed}")
         generator = torch.Generator("cuda").manual_seed(seed)
-        self.pipe.scheduler = SCHEDULERS[scheduler].from_config(self.pipe.scheduler.config)
+        print(f"Using seed: {seed}")
 
-        img = Image.open(image)
-        input_image = self.scale_down_image(image, 1024)
 
-        mas = Image.open(mask)
-        # Assume mask is same size as input image
-        mask_image = mas.resize((input_image.width, input_image.height))
-
-        result = self.pipe(
-            prompt=prompt,
-            negative_prompt=negative_prompt,
-            image=input_image,
-            mask_image=mask_image,
+        #Resize Image for inpaint processing.
+        image = Image.open(image).convert("RGB").resize((1024, 1024))
+        extra_kwargs = {
+            "mask_image": Image.open(mask).convert("RGB").resize(image.size),
+            "image": image
+        }
+        output = self.pipe(
+            prompt=[prompt] * num_outputs if prompt is not None else None,
+            negative_prompt=[negative_prompt] * num_outputs
+            if negative_prompt is not None
+            else None,
             guidance_scale=guidance_scale,
-            num_inference_steps=steps,
-            strength=strength,
             generator=generator,
-            width=input_image.width,
-            height=input_image.height
-        ).images[0]
+            num_inference_steps=num_inference_steps,
+            **extra_kwargs,
+        )
 
-        output_path = "output.png"
-        result.save(output_path)
-        return Path(output_path)
+        output_paths = []
+        for i, sample in enumerate(output.images):
+            output_path = f"/tmp/out-{i}.png"
+            sample.save(output_path)
+            output_paths.append(Path(output_path))
+
+        if len(output_paths) == 0:
+            raise Exception(
+                f"NSFW content detected. Try running it again, or try a different prompt."
+            )
+        
+        print("Prediction complete")
+        return output_paths
